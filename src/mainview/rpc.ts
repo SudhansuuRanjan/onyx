@@ -1,27 +1,27 @@
 import { Electroview } from "electrobun/view";
-import type { CompressXRPC, CompressionProgress, CompressionResult } from "../shared/types";
+import type { CompressXRPC, TaskProgress, TaskResult } from "../shared/types";
 
 // Callbacks that React will set
-let onProgress: ((p: CompressionProgress) => void) | null = null;
-let onComplete: ((r: CompressionResult) => void) | null = null;
+let onProgress: ((p: TaskProgress) => void) | null = null;
+let onComplete: ((r: TaskResult) => void) | null = null;
 let onError: ((msg: string) => void) | null = null;
 
 const rpc = Electroview.defineRPC<CompressXRPC>({
-    maxRequestTime: 300000, // 5 min — file dialog + compression can take a while
+    maxRequestTime: 300000, // 5 min — file dialog + long tasks
     handlers: {
         requests: {},
         messages: {
-            compressionProgress: (p) => onProgress?.(p),
-            compressionComplete: (r) => onComplete?.(r),
-            compressionError: ({ message }) => onError?.(message),
+            taskProgress: (p) => onProgress?.(p),
+            taskComplete: (r) => onComplete?.(r),
+            taskError: ({ message }) => onError?.(message),
         },
     },
 });
 
 const electroview = new Electroview({ rpc });
 
-export function setProgressCallback(cb: (p: CompressionProgress) => void) { onProgress = cb; }
-export function setCompleteCallback(cb: (r: CompressionResult) => void) { onComplete = cb; }
+export function setProgressCallback(cb: (p: TaskProgress) => void) { onProgress = cb; }
+export function setCompleteCallback(cb: (r: TaskResult) => void) { onComplete = cb; }
 export function setErrorCallback(cb: (msg: string) => void) { onError = cb; }
 
 export { electroview };

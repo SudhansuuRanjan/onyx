@@ -4152,58 +4152,120 @@ async function probeVideo(filePath) {
     await proc.exited;
     const data = JSON.parse(output);
     const videoStream = data.streams?.find((s) => s.codec_type === "video");
+    const audioStream = data.streams?.find((s) => s.codec_type === "audio");
     const format = data.format;
     if (!videoStream || !format)
       return null;
-    const filename = filePath.split("/").pop() || filePath;
     return {
-      filename,
+      filename: filePath.split("/").pop() || filePath,
       path: filePath,
       size: parseInt(format.size || "0"),
       duration: parseFloat(format.duration || "0"),
       width: videoStream.width || 0,
       height: videoStream.height || 0,
       codec: videoStream.codec_name || "unknown",
-      bitrate: parseInt(format.bit_rate || "0")
+      bitrate: parseInt(format.bit_rate || "0"),
+      hasAudio: !!audioStream
     };
   } catch (e) {
     console.error("ffprobe error:", e);
     return null;
   }
 }
-function buildFfmpegArgs(inputPath, outputPath, quality, resolution) {
-  const args = [
-    "ffmpeg",
-    "-i",
-    inputPath,
-    "-y",
-    "-progress",
-    "pipe:1",
-    "-v",
-    "quiet"
-  ];
-  const crfMap = { high: 23, medium: 28, low: 35 };
-  args.push("-c:v", "libx264", "-crf", String(crfMap[quality] || 28), "-preset", "medium");
-  if (resolution !== "original") {
-    const scaleMap = { "1080p": "1920:-2", "720p": "1280:-2", "480p": "854:-2" };
-    if (scaleMap[resolution])
-      args.push("-vf", `scale=${scaleMap[resolution]}`);
-  }
-  args.push("-c:a", "aac", "-b:a", "128k", outputPath);
-  return args;
-}
-function getOutputPath(inputPath) {
+function getBasePath(inputPath) {
   const lastDot = inputPath.lastIndexOf(".");
   const ext = lastDot > -1 ? inputPath.substring(lastDot) : ".mp4";
   const base = lastDot > -1 ? inputPath.substring(0, lastDot) : inputPath;
-  return `${base}_compressed${ext}`;
+  return { base, ext };
+}
+async function runFfmpegWithProgress(args, totalDurationUs) {
+  return new Promise((resolve3) => {
+    const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" });
+    currentProcess = proc;
+    let stderrText = "";
+    (async () => {
+      const reader = proc.stdout.getReader();
+      let buffer = "";
+      let progressData = {};
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done)
+            break;
+          buffer += new TextDecoder().decode(value);
+          const lines = buffer.split(`
+`);
+          buffer = lines.pop() || "";
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (trimmed === "progress=continue" || trimmed === "progress=end") {
+              const outTimeUs = parseInt(progressData["out_time_ms"] || "0");
+              const speed = progressData["speed"] || "0x";
+              let percentage = 0;
+              if (totalDurationUs > 0) {
+                percentage = Math.min(99, Math.round(outTimeUs / totalDurationUs * 100));
+              }
+              const speedNum = parseFloat(speed.replace("x", "")) || 0;
+              let eta = "calculating...";
+              if (speedNum > 0 && totalDurationUs > 0) {
+                const remainingUs = totalDurationUs - outTimeUs;
+                const etaS = Math.round(remainingUs / (speedNum * 1e6));
+                eta = etaS < 60 ? `${etaS}s` : `${Math.floor(etaS / 60)}m ${etaS % 60}s`;
+              }
+              mainWindow.webview.rpc?.send.taskProgress({
+                percentage,
+                speed,
+                eta,
+                currentTime: outTimeUs / 1e6
+              });
+              progressData = {};
+            } else {
+              const [key, val] = trimmed.split("=");
+              if (key && val !== undefined)
+                progressData[key] = val;
+            }
+          }
+        }
+      } catch (_) {}
+    })();
+    (async () => {
+      try {
+        stderrText = await new Response(proc.stderr).text();
+      } catch (_) {}
+    })();
+    proc.exited.then((exitCode) => {
+      currentProcess = null;
+      resolve3({ exitCode: exitCode ?? 1, stderr: stderrText });
+    });
+  });
+}
+async function executeTask(args, outputPath, originalSize, duration, toolMode, label) {
+  const totalDurationUs = duration * 1e6;
+  const { exitCode, stderr } = await runFfmpegWithProgress(args, totalDurationUs);
+  if (exitCode !== 0) {
+    const errMsg = stderr?.trim() || `ffmpeg exited with code ${exitCode}`;
+    console.error("ffmpeg error:", errMsg);
+    mainWindow.webview.rpc?.send.taskError({ message: errMsg });
+    return null;
+  }
+  const outputSize = Bun.file(outputPath).size;
+  const result = {
+    outputPath,
+    originalSize,
+    outputSize,
+    ratio: Math.round((1 - outputSize / originalSize) * 100),
+    toolMode,
+    label
+  };
+  mainWindow.webview.rpc?.send.taskProgress({ percentage: 100, speed: "", eta: "", currentTime: duration });
+  mainWindow.webview.rpc?.send.taskComplete(result);
+  return result;
 }
 var rpc = BrowserView.defineRPC({
   maxRequestTime: 300000,
   handlers: {
     requests: {
       selectFile: async () => {
-        console.log("selectFile called");
         const paths2 = await exports_Utils.openFileDialog({
           startingFolder: exports_Utils.paths.home,
           allowedFileTypes: "mp4,mov,avi,mkv,webm,flv,wmv,m4v",
@@ -4214,96 +4276,271 @@ var rpc = BrowserView.defineRPC({
         if (!paths2 || paths2.length === 0)
           return null;
         const info = await probeVideo(paths2[0]);
-        console.log("probeVideo result:", info);
         return info;
       },
       compressVideo: async ({ inputPath, settings }) => {
-        console.log("compressVideo called:", inputPath, settings);
         const info = await probeVideo(inputPath);
         if (!info) {
-          mainWindow.webview.rpc?.send.compressionError({ message: "Failed to read video file" });
+          mainWindow.webview.rpc?.send.taskError({ message: "Failed to read video" });
           return null;
         }
-        const outputPath = getOutputPath(inputPath);
-        const totalDurationUs = info.duration * 1e6;
-        const args = buildFfmpegArgs(inputPath, outputPath, settings.quality, settings.resolution);
-        return new Promise((resolve3) => {
-          const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" });
-          currentProcess = proc;
-          (async () => {
-            const reader = proc.stdout.getReader();
-            let buffer = "";
-            let progressData = {};
-            try {
-              while (true) {
-                const { done, value } = await reader.read();
-                if (done)
-                  break;
-                buffer += new TextDecoder().decode(value);
-                const lines = buffer.split(`
-`);
-                buffer = lines.pop() || "";
-                for (const line of lines) {
-                  const trimmed = line.trim();
-                  if (trimmed === "progress=continue" || trimmed === "progress=end") {
-                    const outTimeUs = parseInt(progressData["out_time_ms"] || "0");
-                    const speed = progressData["speed"] || "0x";
-                    let percentage = 0;
-                    if (totalDurationUs > 0) {
-                      percentage = Math.min(99, Math.round(outTimeUs / totalDurationUs * 100));
-                    }
-                    const speedNum = parseFloat(speed.replace("x", "")) || 0;
-                    let eta = "calculating...";
-                    if (speedNum > 0 && totalDurationUs > 0) {
-                      const remainingUs = totalDurationUs - outTimeUs;
-                      const etaS = Math.round(remainingUs / (speedNum * 1e6));
-                      eta = etaS < 60 ? `${etaS}s` : `${Math.floor(etaS / 60)}m ${etaS % 60}s`;
-                    }
-                    mainWindow.webview.rpc?.send.compressionProgress({
-                      percentage,
-                      speed,
-                      eta,
-                      currentTime: outTimeUs / 1e6
-                    });
-                    progressData = {};
-                  } else {
-                    const [key, val] = trimmed.split("=");
-                    if (key && val !== undefined)
-                      progressData[key] = val;
-                  }
-                }
-              }
-            } catch (_) {}
-          })();
-          proc.exited.then(async (exitCode) => {
-            currentProcess = null;
-            if (exitCode !== 0) {
-              const errText = await new Response(proc.stderr).text();
-              mainWindow.webview.rpc?.send.compressionError({
-                message: errText || `ffmpeg exited with code ${exitCode}`
-              });
-              resolve3(null);
-              return;
-            }
-            const compressedSize = Bun.file(outputPath).size;
-            const result = {
-              outputPath,
-              originalSize: info.size,
-              compressedSize,
-              ratio: Math.round((1 - compressedSize / info.size) * 100)
-            };
-            mainWindow.webview.rpc?.send.compressionComplete(result);
-            mainWindow.webview.rpc?.send.compressionProgress({
-              percentage: 100,
-              speed: "",
-              eta: "",
-              currentTime: info.duration
-            });
-            resolve3(result);
-          });
-        });
+        const { base } = getBasePath(inputPath);
+        const outputPath = `${base}_compressed.mp4`;
+        const crfMap = { high: 23, medium: 28, low: 35 };
+        const args = [
+          "ffmpeg",
+          "-i",
+          inputPath,
+          "-y",
+          "-progress",
+          "pipe:1",
+          "-v",
+          "quiet",
+          "-c:v",
+          "libx264",
+          "-crf",
+          String(crfMap[settings.quality] || 28),
+          "-preset",
+          "medium"
+        ];
+        if (settings.resolution !== "original") {
+          const scaleMap = { "1080p": "1920:-2", "720p": "1280:-2", "480p": "854:-2" };
+          if (scaleMap[settings.resolution])
+            args.push("-vf", `scale=${scaleMap[settings.resolution]}`);
+        }
+        args.push("-c:a", "aac", "-b:a", "128k", outputPath);
+        return executeTask(args, outputPath, info.size, info.duration, "compress", "Compressed");
       },
-      cancelCompression: async () => {
+      convertVideo: async ({ inputPath, settings }) => {
+        console.log("convertVideo:", inputPath, settings);
+        const info = await probeVideo(inputPath);
+        if (!info) {
+          mainWindow.webview.rpc?.send.taskError({ message: "Failed to read video" });
+          return null;
+        }
+        const { base } = getBasePath(inputPath);
+        const outputPath = `${base}_converted.${settings.format}`;
+        let args;
+        if (settings.format === "webm") {
+          args = [
+            "ffmpeg",
+            "-i",
+            inputPath,
+            "-y",
+            "-progress",
+            "pipe:1",
+            "-v",
+            "quiet",
+            "-c:v",
+            "libvpx-vp9",
+            "-crf",
+            "30",
+            "-b:v",
+            "0",
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "128k",
+            outputPath
+          ];
+        } else {
+          args = [
+            "ffmpeg",
+            "-i",
+            inputPath,
+            "-y",
+            "-progress",
+            "pipe:1",
+            "-v",
+            "quiet",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "copy",
+            outputPath
+          ];
+        }
+        const label = `Converted to ${settings.format.toUpperCase()}`;
+        return executeTask(args, outputPath, info.size, info.duration, "convert", label);
+      },
+      processAudio: async ({ inputPath, settings }) => {
+        console.log("processAudio:", inputPath, settings);
+        const info = await probeVideo(inputPath);
+        if (!info) {
+          mainWindow.webview.rpc?.send.taskError({ message: "Failed to read video" });
+          return null;
+        }
+        if (!info.hasAudio && (settings.action === "extract" || settings.action === "mute")) {
+          mainWindow.webview.rpc?.send.taskError({ message: "This video has no audio stream" });
+          return null;
+        }
+        const { base } = getBasePath(inputPath);
+        let outputPath;
+        let args;
+        let label;
+        if (settings.action === "extract") {
+          const codecMap = {
+            mp3: ["-c:a", "libmp3lame", "-q:a", "2"],
+            aac: ["-c:a", "aac", "-b:a", "192k"],
+            wav: ["-c:a", "pcm_s16le"]
+          };
+          outputPath = `${base}_audio.${settings.outputFormat}`;
+          const thumbPath = `${base}_thumb.jpg`;
+          let hasThumb = false;
+          if (settings.outputFormat !== "wav") {
+            const thumbProc = Bun.spawn([
+              "ffmpeg",
+              "-i",
+              inputPath,
+              "-y",
+              "-v",
+              "quiet",
+              "-ss",
+              "1",
+              "-vframes",
+              "1",
+              "-q:v",
+              "2",
+              thumbPath
+            ], { stdout: "pipe", stderr: "pipe" });
+            await thumbProc.exited;
+            hasThumb = await Bun.file(thumbPath).exists();
+          }
+          if (hasThumb) {
+            args = [
+              "ffmpeg",
+              "-i",
+              inputPath,
+              "-i",
+              thumbPath,
+              "-y",
+              "-progress",
+              "pipe:1",
+              "-v",
+              "quiet",
+              "-map",
+              "0:a",
+              "-map",
+              "1:0",
+              ...codecMap[settings.outputFormat],
+              "-id3v2_version",
+              "3",
+              "-metadata:s:v",
+              "title=Cover",
+              "-metadata:s:v",
+              "comment=Cover (front)",
+              "-disposition:v:0",
+              "attached_pic",
+              outputPath
+            ];
+          } else {
+            args = [
+              "ffmpeg",
+              "-i",
+              inputPath,
+              "-y",
+              "-progress",
+              "pipe:1",
+              "-v",
+              "quiet",
+              "-vn",
+              ...codecMap[settings.outputFormat],
+              outputPath
+            ];
+          }
+          label = `Audio extracted as ${settings.outputFormat.toUpperCase()}`;
+          const result = await executeTask(args, outputPath, info.size, info.duration, "audio", label);
+          if (hasThumb)
+            try {
+              Bun.spawn(["rm", thumbPath]);
+            } catch (_) {}
+          return result;
+        } else if (settings.action === "strip") {
+          outputPath = `${base}_noaudio${getBasePath(inputPath).ext}`;
+          args = [
+            "ffmpeg",
+            "-i",
+            inputPath,
+            "-y",
+            "-progress",
+            "pipe:1",
+            "-v",
+            "quiet",
+            "-an",
+            "-c:v",
+            "copy",
+            outputPath
+          ];
+          label = "Audio stripped";
+        } else {
+          outputPath = `${base}_muted${getBasePath(inputPath).ext}`;
+          args = [
+            "ffmpeg",
+            "-i",
+            inputPath,
+            "-y",
+            "-progress",
+            "pipe:1",
+            "-v",
+            "quiet",
+            "-c:v",
+            "copy",
+            "-af",
+            "volume=0",
+            outputPath
+          ];
+          label = "Audio muted";
+        }
+        return executeTask(args, outputPath, info.size, info.duration, "audio", label);
+      },
+      makeGif: async ({ inputPath, settings }) => {
+        console.log("makeGif:", inputPath, settings);
+        const info = await probeVideo(inputPath);
+        if (!info) {
+          mainWindow.webview.rpc?.send.taskError({ message: "Failed to read video" });
+          return null;
+        }
+        const { base } = getBasePath(inputPath);
+        const palettePath = `${base}_palette.png`;
+        const outputPath = `${base}.gif`;
+        const width = settings.width === 0 ? -1 : settings.width;
+        const fps = settings.fps;
+        const filters = `fps=${fps},scale=${width}:-1:flags=lanczos`;
+        mainWindow.webview.rpc?.send.taskProgress({ percentage: 0, speed: "", eta: "Generating palette...", currentTime: 0 });
+        const palProc = Bun.spawn([
+          "ffmpeg",
+          "-i",
+          inputPath,
+          "-y",
+          "-v",
+          "quiet",
+          "-vf",
+          `${filters},palettegen`,
+          palettePath
+        ], { stdout: "pipe", stderr: "pipe" });
+        await palProc.exited;
+        const args = [
+          "ffmpeg",
+          "-i",
+          inputPath,
+          "-i",
+          palettePath,
+          "-y",
+          "-progress",
+          "pipe:1",
+          "-v",
+          "quiet",
+          "-lavfi",
+          `${filters} [x];[x][1:v]paletteuse`,
+          outputPath
+        ];
+        const result = await executeTask(args, outputPath, info.size, info.duration, "gif", "GIF created");
+        try {
+          await Bun.file(palettePath).exists() && Bun.spawn(["rm", palettePath]);
+        } catch (_) {}
+        return result;
+      },
+      cancelTask: async () => {
         if (currentProcess) {
           currentProcess.kill();
           currentProcess = null;
@@ -4314,6 +4551,107 @@ var rpc = BrowserView.defineRPC({
       showInFolder: async ({ path }) => {
         exports_Utils.showItemInFolder(path);
         return true;
+      },
+      selectSecondFile: async () => {
+        const paths2 = await exports_Utils.openFileDialog({
+          startingFolder: exports_Utils.paths.home,
+          allowedFileTypes: "mp4,mov,avi,mkv,webm,flv,wmv,m4v",
+          canChooseFiles: true,
+          canChooseDirectory: false,
+          allowsMultipleSelection: false
+        });
+        if (!paths2 || paths2.length === 0)
+          return null;
+        const filename = paths2[0].split("/").pop() || paths2[0];
+        return { path: paths2[0], filename };
+      },
+      mergeVideos: async ({ inputPath, settings }) => {
+        const info = await probeVideo(inputPath);
+        if (!info) {
+          mainWindow.webview.rpc?.send.taskError({ message: "Failed to read first video" });
+          return null;
+        }
+        const info2 = await probeVideo(settings.secondPath);
+        if (!info2) {
+          mainWindow.webview.rpc?.send.taskError({ message: "Failed to read second video" });
+          return null;
+        }
+        const { base } = getBasePath(inputPath);
+        const outputPath = `${base}_merged.mp4`;
+        const totalDuration = info.duration + info2.duration;
+        const totalSize = info.size + info2.size;
+        const tempA = `${base}_partA.ts`;
+        const tempB = `${base}_partB.ts`;
+        mainWindow.webview.rpc?.send.taskProgress({ percentage: 0, speed: "", eta: "Preparing first video...", currentTime: 0 });
+        const procA = Bun.spawn([
+          "ffmpeg",
+          "-i",
+          inputPath,
+          "-y",
+          "-v",
+          "quiet",
+          "-c:v",
+          "libx264",
+          "-preset",
+          "fast",
+          "-crf",
+          "23",
+          "-c:a",
+          "aac",
+          "-b:a",
+          "128k",
+          "-bsf:v",
+          "h264_mp4toannexb",
+          "-f",
+          "mpegts",
+          tempA
+        ], { stdout: "pipe", stderr: "pipe" });
+        await procA.exited;
+        mainWindow.webview.rpc?.send.taskProgress({ percentage: 25, speed: "", eta: "Preparing second video...", currentTime: 0 });
+        const procB = Bun.spawn([
+          "ffmpeg",
+          "-i",
+          settings.secondPath,
+          "-y",
+          "-v",
+          "quiet",
+          "-c:v",
+          "libx264",
+          "-preset",
+          "fast",
+          "-crf",
+          "23",
+          "-c:a",
+          "aac",
+          "-b:a",
+          "128k",
+          "-bsf:v",
+          "h264_mp4toannexb",
+          "-f",
+          "mpegts",
+          tempB
+        ], { stdout: "pipe", stderr: "pipe" });
+        await procB.exited;
+        const args = [
+          "ffmpeg",
+          "-y",
+          "-progress",
+          "pipe:1",
+          "-v",
+          "quiet",
+          "-i",
+          `concat:${tempA}|${tempB}`,
+          "-c",
+          "copy",
+          "-bsf:a",
+          "aac_adtstoasc",
+          outputPath
+        ];
+        const result = await executeTask(args, outputPath, totalSize, totalDuration, "merge", "Videos merged");
+        try {
+          Bun.spawn(["rm", tempA, tempB]);
+        } catch (_) {}
+        return result;
       }
     },
     messages: {}
@@ -4337,11 +4675,55 @@ var mainWindow = new BrowserWindow({
   title: "CompressX",
   url,
   rpc,
-  frame: { width: 850, height: 650, x: 200, y: 200 }
+  frame: { width: 1300, height: 800, x: 100, y: 100 }
 });
 mainWindow.on("close", () => {
   if (currentProcess)
     currentProcess.kill();
   exports_Utils.quit();
 });
+var PREVIEW_PORT = 50100;
+Bun.serve({
+  port: PREVIEW_PORT,
+  async fetch(req) {
+    const url2 = new URL(req.url);
+    if (url2.pathname !== "/preview") {
+      return new Response("Not found", { status: 404 });
+    }
+    const filePath = url2.searchParams.get("path");
+    if (!filePath)
+      return new Response("Missing path", { status: 400 });
+    const file = Bun.file(filePath);
+    if (!await file.exists())
+      return new Response("File not found", { status: 404 });
+    const rangeHeader = req.headers.get("range");
+    const fileSize = file.size;
+    if (rangeHeader) {
+      const match = rangeHeader.match(/bytes=(\d+)-(\d*)/);
+      if (match) {
+        const start = parseInt(match[1]);
+        const end = match[2] ? parseInt(match[2]) : fileSize - 1;
+        const chunk = file.slice(start, end + 1);
+        return new Response(chunk, {
+          status: 206,
+          headers: {
+            "Content-Range": `bytes ${start}-${end}/${fileSize}`,
+            "Accept-Ranges": "bytes",
+            "Content-Length": String(end - start + 1),
+            "Content-Type": file.type || "video/mp4",
+            "Access-Control-Allow-Origin": "*"
+          }
+        });
+      }
+    }
+    return new Response(file, {
+      headers: {
+        "Content-Type": file.type || "video/mp4",
+        "Accept-Ranges": "bytes",
+        "Access-Control-Allow-Origin": "*"
+      }
+    });
+  }
+});
+console.log(`Preview server at http://localhost:${PREVIEW_PORT}`);
 console.log("CompressX started!");
