@@ -11,9 +11,18 @@ export type VideoInfo = {
     bitrate: number;
     hasAudio: boolean;
 };
+// Pipeline definitions
+export interface PipelineStep {
+    id: string;
+    mode: Exclude<ToolMode, "pipeline" | "merge" | "screenshot">;
+    settings: any;
+}
 
+export type PipelineSettings = {
+    steps: PipelineStep[];
+};
 // Tool modes
-export type ToolMode = "compress" | "convert" | "audio" | "gif" | "merge" | "trim" | "crop" | "rotate" | "speed" | "volume" | "watermark" | "screenshot" | "replace-audio";
+export type ToolMode = "compress" | "convert" | "audio" | "gif" | "merge" | "trim" | "crop" | "rotate" | "speed" | "volume" | "watermark" | "screenshot" | "replace-audio" | "pipeline" | "aspect-ratio" | "reverse";
 
 // Per-tool settings
 export type CompressionSettings = {
@@ -68,7 +77,11 @@ export type VolumeSettings = {
 };
 
 export type WatermarkSettings = {
+    mode: "image" | "text";
     imagePath: string;
+    text: string;
+    textColor: string;
+    fontSize: number;
     position: "top-left" | "top-right" | "bottom-left" | "bottom-right" | "center";
 };
 
@@ -79,6 +92,16 @@ export type ScreenshotSettings = {
 export type ReplaceAudioSettings = {
     audioPath: string;
     audioFilename: string;
+};
+
+export type AspectRatioSettings = {
+    ratio: "16:9" | "9:16" | "1:1" | "4:5" | "21:9";
+    background: "blur" | "black" | "white";
+};
+
+export type ReverseSettings = {
+    // No specific settings for now, maybe speed later?
+    dummy?: boolean;
 };
 
 // Progress/result types (shared across all tools)
@@ -182,6 +205,18 @@ export type CompressXRPC = {
             selectAudioFile: {
                 params: {};
                 response: { path: string; filename: string } | null;
+            };
+            saveTempImage: {
+                params: { dataUrl: string };
+                response: string;
+            };
+            convertAspectRatio: {
+                params: { inputPath: string; settings: AspectRatioSettings };
+                response: TaskResult | null;
+            };
+            runPipeline: {
+                params: { inputPath: string; settings: PipelineSettings };
+                response: TaskResult | null;
             };
         };
         messages: {};

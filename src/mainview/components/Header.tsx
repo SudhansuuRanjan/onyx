@@ -9,7 +9,7 @@ export function Header() {
                             <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
                         </svg>
                     </div>
-                    <h1 className="text-xl font-bold tracking-tight bg-gradient-to-br from-t-primary to-accent-hover bg-clip-text text-transparent">CompressX</h1>
+                    <h1 className="text-xl font-bold tracking-tight bg-gradient-to-br from-t-primary to-accent-hover bg-clip-text text-transparent">Onyx</h1>
                 </div>
                 <p className="text-[13px] text-t-muted font-normal">Video tools powered by ffmpeg</p>
             </div>
